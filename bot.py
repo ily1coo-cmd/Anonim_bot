@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 from pathlib import Path
+from typing import TypedDict
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -45,6 +46,28 @@ logger = logging.getLogger(__name__)
 LINKS_FILE = Path("links.json")       # token -> creator_chat_id
 PENDING_FILE = Path("pending.json")   # forwarded_msg_id -> sender_chat_id
 SESSIONS_FILE = Path("sessions.json") # sender_chat_id -> creator_chat_id
+MODERATION_FILE = Path("moderation.json")  # owner_id -> moderation settings
+
+DEFAULT_BLOCKED_WORDS = {
+    "бля",
+    "блядь",
+    "ебать",
+    "еблан",
+    "заеб",
+    "мразь",
+    "пизд",
+    "сук",
+    "хуй",
+    "шлюх",
+}
+
+ANONYMOUS_LABEL = "🔒 Анонимное сообщение"
+REPLY_HEADER = "📩 Ответ на ваше анонимное сообщение:"
+
+
+class ModerationSettings(TypedDict):
+    filter_enabled: bool
+    custom_words: list[str]
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции для работы с JSON-хранилищем
@@ -84,6 +107,9 @@ pending_messages: dict[int, int] = {}
 # Активная сессия: отправитель знает, кому он пишет
 sessions: dict[int, int] = {}
 
+# owner_id (int) -> {filter_enabled: bool, custom_words: list[str]}
+moderation_settings: dict[int, ModerationSettings] = {}
+
 
 # ---------------------------------------------------------------------------
 # FSM: состояние ожидания ответа от создателя
@@ -99,7 +125,7 @@ reply_targets: dict[int, int] = {}
 
 def _load_all() -> None:
     """Загрузить все данные с диска в глобальные переменные."""
-    global links, pending_messages, sessions
+    global links, pending_messages, sessions, moderation_settings
 
     raw_links = load_json(LINKS_FILE, {})
     links = {token: int(cid) for token, cid in raw_links.items()}
@@ -109,6 +135,20 @@ def _load_all() -> None:
 
     raw_sessions = load_json(SESSIONS_FILE, {})
     sessions = {int(sid): int(cid) for sid, cid in raw_sessions.items()}
+
+    raw_moderation = load_json(MODERATION_FILE, {})
+    moderation_settings = {
+        int(owner_id): {
+            "filter_enabled": settings.get("filter_enabled", True),
+            "custom_words": [
+                str(word).casefold()
+                for word in settings.get("custom_words", [])
+                if str(word).strip()
+            ],
+        }
+        for owner_id, settings in raw_moderation.items()
+        if isinstance(settings, dict)
+    }
 
     logger.info(
         "Загружено: %d токенов, %d отложенных, %d сессий",
@@ -128,6 +168,70 @@ def _save_sessions() -> None:
     save_json(SESSIONS_FILE, {str(sid): str(cid) for sid, cid in sessions.items()})
 
 
+def _save_moderation() -> None:
+    save_json(MODERATION_FILE, {str(owner_id): settings for owner_id, settings in moderation_settings.items()})
+
+
+def _owner_moderation(owner_id: int) -> ModerationSettings:
+    settings = moderation_settings.setdefault(
+        owner_id,
+        {"filter_enabled": True, "custom_words": []},
+    )
+    return settings
+
+
+def _contains_blocked_word(text: str | None, owner_id: int) -> bool:
+    if not text:
+        return False
+
+    settings = _owner_moderation(owner_id)
+    if not settings["filter_enabled"]:
+        return False
+
+    custom_words = settings["custom_words"]
+    words = DEFAULT_BLOCKED_WORDS | set(custom_words)
+    normalized_text = text.casefold()
+    return any(word in normalized_text for word in words)
+
+
+async def _copy_to_owner(message: Message, bot: Bot, owner_id: int) -> int:
+    """Copy a message and attach the anonymous label where Telegram allows it."""
+    caption = message.caption
+    if caption:
+        label = f"{caption}\n\n{ANONYMOUS_LABEL}"
+        if len(label) > 1024:
+            label = f"{caption[:1024 - len(ANONYMOUS_LABEL) - 2]}\n\n{ANONYMOUS_LABEL}"
+        copied = await bot.copy_message(
+            chat_id=owner_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            caption=label,
+            reply_markup=_reply_keyboard(message.from_user.id),
+        )
+        return copied.message_id
+
+    copied = await bot.copy_message(
+        chat_id=owner_id,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+    label_message = await bot.send_message(
+        chat_id=owner_id,
+        text=ANONYMOUS_LABEL,
+        reply_markup=_reply_keyboard(message.from_user.id),
+    )
+    return label_message.message_id
+
+
+async def _copy_reply_to_sender(message: Message, bot: Bot, sender_id: int) -> None:
+    await bot.send_message(chat_id=sender_id, text=REPLY_HEADER)
+    await bot.copy_message(
+        chat_id=sender_id,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Роутер и обработчики
 # ---------------------------------------------------------------------------
@@ -137,7 +241,7 @@ router = Router()
 # ── /start без параметра ────────────────────────────────────────────────────
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, bot: Bot) -> None:
+async def cmd_start(message: Message) -> None:
     """
     Обрабатывает /start как с аргументом (deep-link), так и без.
     aiogram передаёт payload после /start в message.text, поэтому
@@ -209,6 +313,67 @@ async def cmd_create(message: Message, bot: Bot) -> None:
     )
 
 
+# ── Настройки фильтра владельца ─────────────────────────────────────────────
+
+@router.message(Command("filter_on"))
+async def cmd_filter_on(message: Message) -> None:
+    settings = _owner_moderation(message.from_user.id)
+    settings["filter_enabled"] = True
+    _save_moderation()
+    await message.answer("✅ Фильтр запрещённых слов включён для всех ваших ссылок.")
+
+
+@router.message(Command("filter_off"))
+async def cmd_filter_off(message: Message) -> None:
+    settings = _owner_moderation(message.from_user.id)
+    settings["filter_enabled"] = False
+    _save_moderation()
+    await message.answer("⚠️ Фильтр запрещённых слов выключен для всех ваших ссылок.")
+
+
+@router.message(Command("add_word"))
+async def cmd_add_word(message: Message) -> None:
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await message.answer("Использование: /add_word <слово>")
+        return
+
+    word = args[1].strip().casefold()
+    settings = _owner_moderation(message.from_user.id)
+    custom_words = settings["custom_words"]
+    if word not in custom_words:
+        custom_words.append(word)
+        _save_moderation()
+    await message.answer(f"✅ Слово «{word}» добавлено в ваш список.")
+
+
+@router.message(Command("remove_word"))
+async def cmd_remove_word(message: Message) -> None:
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await message.answer("Использование: /remove_word <слово>")
+        return
+
+    word = args[1].strip().casefold()
+    settings = _owner_moderation(message.from_user.id)
+    custom_words = settings["custom_words"]
+    if word in custom_words:
+        custom_words.remove(word)
+        _save_moderation()
+        await message.answer(f"✅ Слово «{word}» удалено из вашего списка.")
+    else:
+        await message.answer("ℹ️ Этого слова нет в вашем пользовательском списке.")
+
+
+@router.message(Command("my_words"))
+async def cmd_my_words(message: Message) -> None:
+    settings = _owner_moderation(message.from_user.id)
+    custom_words = settings["custom_words"]
+    status = "включён" if settings["filter_enabled"] else "выключен"
+    words = ", ".join(custom_words) if custom_words else "нет"
+    await message.answer(f"Фильтр: {status}.\nВаши слова: {words}")
+
+
 # ── Вспомогательная функция: inline-кнопка «Ответить» ───────────────────────
 
 def _reply_keyboard(sender_chat_id: int) -> InlineKeyboardMarkup:
@@ -234,8 +399,6 @@ async def cb_reply(callback: CallbackQuery, state: FSMContext) -> None:
     Переводим его в режим ожидания текста ответа.
     """
     sender_id = int(callback.data.split(":")[1])
-    creator_id = callback.from_user.id
-
     # Сохраняем цель ответа в FSM-контексте
     await state.set_state(ReplyState.waiting_for_reply)
     await state.update_data(sender_id=sender_id)
@@ -257,23 +420,16 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 # ── Получение текста ответа от создателя (FSM) ───────────────────────────────
 
-@router.message(F.text, ReplyState.waiting_for_reply)
-async def fsm_reply_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Создатель находится в режиме ответа — отправляем его текст анонимному пользователю."""
+@router.message(ReplyState.waiting_for_reply)
+async def fsm_reply(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Создатель находится в режиме ответа — копируем любой тип сообщения анониму."""
     data = await state.get_data()
     sender_id: int = data["sender_id"]
 
     await state.clear()
 
     try:
-        await bot.send_message(
-            chat_id=sender_id,
-            text=(
-                "📩 <b>Ответ на ваше анонимное сообщение:</b>\n\n"
-                f"{message.text}"
-            ),
-            parse_mode="HTML",
-        )
+        await _copy_reply_to_sender(message, bot, sender_id)
         await message.answer("✅ Ваш ответ доставлен анонимному отправителю.")
     except Exception as exc:
         logger.error("Ошибка при отправке ответа пользователю %d: %s", sender_id, exc)
@@ -282,12 +438,12 @@ async def fsm_reply_text(message: Message, state: FSMContext, bot: Bot) -> None:
         )
 
 
-# ── Обработка входящих текстовых сообщений ──────────────────────────────────
+# ── Обработка входящих сообщений любых типов ────────────────────────────────
 
-@router.message(F.text)
-async def handle_text(message: Message, bot: Bot) -> None:
+@router.message()
+async def handle_message(message: Message, bot: Bot) -> None:
     """
-    Центральный обработчик текста. Логика:
+    Центральный обработчик сообщений. Логика:
     1. Если сообщение — ответ (reply) через Telegram-reply на пересланное сообщение
        → отправить ответ обратно анонимному отправителю.
     2. Если пользователь состоит в активной сессии (перешёл по ссылке)
@@ -309,14 +465,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
             return
 
         try:
-            await bot.send_message(
-                chat_id=sender_id,
-                text=(
-                    "📩 <b>Ответ на ваше анонимное сообщение:</b>\n\n"
-                    f"{message.text}"
-                ),
-                parse_mode="HTML",
-            )
+            await _copy_reply_to_sender(message, bot, sender_id)
             await message.answer("✅ Ваш ответ доставлен анонимному отправителю.")
         except Exception as exc:
             logger.error("Ошибка при отправке ответа пользователю %d: %s", sender_id, exc)
@@ -329,16 +478,15 @@ async def handle_text(message: Message, bot: Bot) -> None:
     if user_id in sessions:
         creator_id = sessions[user_id]
 
-        try:
-            sent = await bot.send_message(
-                chat_id=creator_id,
-                text=(
-                    "🔒 <b>Анонимное сообщение:</b>\n\n"
-                    f"{message.text}"
-                ),
-                parse_mode="HTML",
-                reply_markup=_reply_keyboard(user_id),  # ← кнопка «Ответить»
+        content = message.text or message.caption
+        if _contains_blocked_word(content, creator_id):
+            await message.answer(
+                "Ваше сообщение не доставлено, так как содержит запрещённые слова",
             )
+            return
+
+        try:
+            sent_message_id = await _copy_to_owner(message, bot, creator_id)
         except Exception as exc:
             logger.error("Ошибка при пересылке сообщения создателю %d: %s", creator_id, exc)
             await message.answer(
@@ -347,7 +495,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
             return
 
         # Связываем message_id пересланного сообщения с chat_id отправителя
-        pending_messages[sent.message_id] = user_id
+        pending_messages[sent_message_id] = user_id
         _save_pending()
 
         await message.answer("✅ Ваше анонимное сообщение отправлено.")
