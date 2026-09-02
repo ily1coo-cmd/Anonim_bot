@@ -47,6 +47,7 @@ LINKS_FILE = Path("links.json")       # token -> creator_chat_id
 PENDING_FILE = Path("pending.json")   # forwarded_msg_id -> sender_chat_id
 SESSIONS_FILE = Path("sessions.json") # sender_chat_id -> creator_chat_id
 MODERATION_FILE = Path("moderation.json")  # owner_id -> moderation settings
+SUBSCRIBERS_FILE = Path("subscribers.json")  # пользователи, запустившие бота
 
 DEFAULT_BLOCKED_WORDS = {
     "бля",
@@ -110,6 +111,9 @@ sessions: dict[int, int] = {}
 # owner_id (int) -> {filter_enabled: bool, custom_words: list[str]}
 moderation_settings: dict[int, ModerationSettings] = {}
 
+# chat_id пользователей, которые запускали бота
+subscribers: set[int] = set()
+
 
 # ---------------------------------------------------------------------------
 # FSM: состояние ожидания ответа от создателя
@@ -119,13 +123,17 @@ class ReplyState(StatesGroup):
     waiting_for_reply = State()
 
 
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
+
+
 # creator_chat_id -> sender_chat_id (кому сейчас пишет создатель через кнопку)
 reply_targets: dict[int, int] = {}
 
 
 def _load_all() -> None:
     """Загрузить все данные с диска в глобальные переменные."""
-    global links, pending_messages, sessions, moderation_settings
+    global links, pending_messages, sessions, moderation_settings, subscribers
 
     raw_links = load_json(LINKS_FILE, {})
     links = {token: int(cid) for token, cid in raw_links.items()}
@@ -150,6 +158,13 @@ def _load_all() -> None:
         if isinstance(settings, dict)
     }
 
+    raw_subscribers = load_json(SUBSCRIBERS_FILE, {})
+    subscribers = (
+        {int(user_id) for user_id in raw_subscribers}
+        | set(sessions)
+        | set(links.values())
+    )
+
     logger.info(
         "Загружено: %d токенов, %d отложенных, %d сессий",
         len(links), len(pending_messages), len(sessions),
@@ -170,6 +185,19 @@ def _save_sessions() -> None:
 
 def _save_moderation() -> None:
     save_json(MODERATION_FILE, {str(owner_id): settings for owner_id, settings in moderation_settings.items()})
+
+
+def _save_subscribers() -> None:
+    save_json(SUBSCRIBERS_FILE, {str(user_id): True for user_id in subscribers})
+
+
+def _admin_id() -> int | None:
+    value = os.getenv("ADMIN_ID")
+    try:
+        return int(value) if value else None
+    except ValueError:
+        logger.warning("ADMIN_ID должен быть числом")
+        return None
 
 
 def _owner_moderation(owner_id: int) -> ModerationSettings:
@@ -255,6 +283,10 @@ async def cmd_start(message: Message) -> None:
     aiogram передаёт payload после /start в message.text, поэтому
     извлекаем его вручную.
     """
+    if message.from_user.id not in subscribers:
+        subscribers.add(message.from_user.id)
+        _save_subscribers()
+
     args = message.text.split(maxsplit=1)
     token = args[1].strip() if len(args) > 1 else None
 
@@ -318,6 +350,58 @@ async def cmd_create(message: Message, bot: Bot) -> None:
         f"<code>{link}</code>\n\n"
         f"Поделитесь ей с теми, от кого хотите получать анонимные сообщения.",
         parse_mode="HTML",
+    )
+
+
+# ── /broadcast — рассылка сообщения администратора ──────────────────────────
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != _admin_id():
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+
+    await state.set_state(BroadcastState.waiting_for_message)
+    await message.answer(
+        "📢 Отправьте следующее сообщение для рассылки всем пользователям.\n"
+        "Поддерживаются текст, фото, видео, документы и другие типы.\n"
+        "Для отмены отправьте /cancel.",
+    )
+
+
+@router.message(Command("cancel"), BroadcastState.waiting_for_message)
+async def cmd_broadcast_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ Рассылка отменена.")
+
+
+@router.message(BroadcastState.waiting_for_message)
+async def broadcast_message(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.from_user.id != _admin_id():
+        await state.clear()
+        return
+
+    await state.clear()
+    delivered = 0
+    failed = 0
+
+    for user_id in tuple(subscribers):
+        if user_id == message.from_user.id:
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            delivered += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            failed += 1
+            logger.warning("Не удалось отправить рассылку пользователю %d: %s", user_id, exc)
+
+    await message.answer(
+        f"✅ Рассылка завершена. Доставлено: {delivered}. Ошибок: {failed}.",
     )
 
 
