@@ -196,6 +196,14 @@ def _contains_blocked_word(text: str | None, owner_id: int) -> bool:
 
 async def _copy_to_owner(message: Message, bot: Bot, owner_id: int) -> int:
     """Copy a message and attach the anonymous label where Telegram allows it."""
+    if message.text is not None:
+        sent = await bot.send_message(
+            chat_id=owner_id,
+            text=f"{ANONYMOUS_LABEL}\n\n{message.text}",
+            reply_markup=_reply_keyboard(message.from_user.id),
+        )
+        return sent.message_id
+
     caption = message.caption
     if caption:
         label = f"{caption}\n\n{ANONYMOUS_LABEL}"
